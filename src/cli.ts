@@ -12,10 +12,14 @@ const commandExists = require("command-exists");
 const meow = require("meow");
 const plist = require("plist");
 const fetch = require("node-fetch");
+const fs = require("fs");
 const getStdin = require("get-stdin");
+const http = require("http");
+const https = require("https");
 const { render } = require("svg-term");
 const sander = require("@marionebl/sander");
 const SVGO = require("svgo");
+const INI = require('ini');
 
 interface Guesses {
   [key: string]: string | null;
@@ -49,6 +53,7 @@ withCli(
     --height        height in lines [number]
     --help          print this help [boolean]
     --in            json file to use as input [string]
+    --insecure      disables ssl certificate verification on url fetches [boolean]
     --no-cursor     disable cursor rendering [boolean]
     --no-optimize   disable svgo optimization [boolean]
     --out           output file, emits to stdout if omitted, [string]
@@ -67,7 +72,7 @@ withCli(
     $ svg-term --cast 113643 --out examples/parrot.svg
 `,
   {
-    boolean: ["cursor", "help", "optimize", "version", "window"],
+    boolean: ["cursor", "help", "insecure", "optimize", "version", "window"],
     string: [
       "at",
       "cast",
@@ -87,6 +92,7 @@ withCli(
     default: {
       cursor: true,
       optimize: true,
+      insecure: false, // When omitted, we should enforce checking.
       window: false
     }
   }
@@ -331,6 +337,17 @@ function guessProfile(term: GuessedTerminal): string | null {
 }
 
 async function getInput(cli: SvgTermCli) {
+  var agentOptions = {
+    // Need to reverse the default toBoolean behavior.
+    // Presence of the --insecure flag should mark rejectUnauthorized as false
+    rejectUnauthorized: toBoolean(cli.flags.insecure, true) ? false : true,
+  };
+
+  // Options for the fetch call
+  var options = {
+    agent: new https.Agent(agentOptions)
+  }
+
   if (cli.flags.command) {
     return record(cli.flags.command);
   }
@@ -340,11 +357,43 @@ async function getInput(cli: SvgTermCli) {
   }
 
   if (cli.flags.cast) {
-    const response = await fetch(
-      `https://asciinema.org/a/${cli.flags.cast}.cast?dl=true`
-    );
+    var env = "https://asciinema.org";
+    var aPath = os.homedir() + "/.config/asciinema/config"
 
-    return response.text();
+    // Let's start with prioritizing an environment variable override
+    if (process.env["ASCIINEMA_API_URL"]) {
+      env = process.env["ASCIINEMA_API_URL"] || "https://127.0.0.1";
+    } else if ((fs.existsSync(aPath)) && (!process.env["ASCIINEMA_API_URL"])) {
+      console.log("Searching for " + aPath);
+      // Parsing INI asciinema config file for provided url
+      env = INI.parse(fs.readFileSync(aPath, 'utf8')).api.url;
+    }
+
+   console.log("Asciinema Server Url calculated as: " + [env,
+      `/a/${cli.flags.cast}.cast?dl=true`].join(""))
+
+    // Need to avoid using SSL agent options for non-ssl urls
+    if (env.toUpperCase().startsWith("HTTP://")) {
+      options = {
+        agent: new http.Agent(agentOptions)
+      };
+    }
+
+    try {
+      const response = await fetch(
+        [env,
+        `/a/${cli.flags.cast}.cast?dl=true`].join(""), options
+      );
+      return response.text();
+
+    } catch (err) {
+      if (err.code === 'ERR_INVALID_PROTOCOL') {
+        console.log("It appears that your config uses a non-ssl (HTTP) url, however your url target is redirecting to an SSL context.");
+        console.log("Consider modifying your config to an ssl (HTTPS) context");
+      }
+      throw new Error(err.message);
+    } 
+
   }
 
   return getStdin();
